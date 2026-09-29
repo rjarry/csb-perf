@@ -31,6 +31,7 @@ Two things make it visible again:
 | `prometheus/bpfstats.py` | Reads per-program eBPF run-time via `bpf(2)` directly (no `bpftool` dependency); enables run-time stats and holds the fd so they auto-disable on exit. |
 | `syscall-bench.c` | `syscall-bench`: measures per-call latency of `getpid`/`openat`/`execve`. Distinct binary name for EDR allowlisting; optional CPU pinning. |
 | `prometheus/capture-baseline.py` | Captures the no-EDR baseline (A/B/A, with BPF-detach verification). |
+| `prometheus/compile-ab.py` | A/B benchmark of a *real* build with the sensors ON vs momentarily OFF (falcon eBPF-detach verified). Reports the per-build wall-clock, kernel-CPU, energy and eBPF deltas. Project-agnostic. |
 | `prometheus/file-trace.bt` | bpftrace script logging a process's file access (open/read/write/stat/readdir). Used to see *what* osquery touches. |
 | `prometheus/prometheus.yml` | Prometheus scrape config (self + exporter on :9599). |
 | `grafana/dashboards/power.json` | Grafana dashboard. |
@@ -98,6 +99,52 @@ to osquery vs falcon separately.
 The output (`/var/lib/power-exporter/syscall-baseline.json` by default) is
 tagged with the kernel and sensor versions; `node_syscall_baseline_stale` flags
 when the running kernel no longer matches, i.e. when to recapture.
+
+## A/B compile benchmark
+
+`compile-ab.py` measures what the sensors cost a *real* build, end to end, in
+wall-clock time — the number developers actually feel. It interleaves the same
+build with the sensors ON vs momentarily OFF (verifying falcon's eBPF programs
+actually detached, and discarding any "off" build during which eBPF still ran),
+pins the CPU governor, runs each build in a throwaway cgroup to capture the whole
+process tree's CPU and peak RSS, and brackets it with RAPL energy and eBPF
+run-time deltas. Services and governor are always restored on exit.
+
+It is project-agnostic. Run it as root **from your project directory** (or pass
+`--workdir`); the build itself runs as `--user` (default `$SUDO_USER`) so it does
+not create root-owned files, and `ccache` is disabled for the timed build so you
+measure real compilation.
+
+```sh
+# edit-rebuild loop of a make-based project (the frequent dev inner loop)
+cd ~/src/myproject
+sudo /etc/prometheus/compile-ab.py --build-cmd 'make -j$(nproc)'
+
+# meson/ninja project, full clean rebuild each repetition
+sudo /etc/prometheus/compile-ab.py \
+    --dirty-cmd 'ninja -C build clean' --build-cmd 'ninja -C build'
+
+# more repetitions, and your real cadence for the time-lost projection
+sudo /etc/prometheus/compile-ab.py --reps 7 --builds-per-day 40
+
+# a different agent / service set (defaults target the CSB stack)
+sudo /etc/prometheus/compile-ab.py \
+    --falcon-services falcon-sensor --other-services SplunkForwarder,orbit
+```
+
+By default each repetition recompiles the tracked C/C++/Rust/Go sources
+(`--dirty-cmd` touches them); override `--dirty-cmd` for a full rebuild or a
+different language. Results are written to `--out`
+(`/var/lib/power-exporter/compile-ab.json`) and printed as a summary:
+
+```
+wall-clock   ON 17.96s   OFF 14.53s
+  -> EDR costs +3.44s per build (+23.7% slower)
+  -> at 20 builds/day: 1.1 min/day, 4.4 h/year/engineer
+```
+
+(Run it uninstalled with `sudo ./prometheus/compile-ab.py --workdir <project>`;
+it imports `bpfstats` from the same directory.)
 
 ## Benchmark caveats
 

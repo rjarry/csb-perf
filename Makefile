@@ -13,6 +13,7 @@ install: syscall-bench
 	install -Dm644 -t /etc/prometheus prometheus/file-trace.bt
 	install -Dm644 -t /etc/prometheus prometheus/prometheus.yml
 	install -Dm755 -t /etc/prometheus prometheus/capture-baseline.py
+	install -Dm755 -t /etc/prometheus prometheus/compile-ab.py
 	install -Dm755 -t /etc/prometheus prometheus/power-exporter.py
 	install -Dm644 -t /etc/grafana/dashboards/ grafana/dashboards/*.json
 	install -Dm644 -t /etc/grafana/provisioning/dashboards/ grafana/provisioning/dashboards/*.yaml
