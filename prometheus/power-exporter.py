@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+
+import argparse
+import http.server
+import json
+import os
+import pathlib
+import subprocess
+import threading
+import time
+
+import bpfstats
+
+RAPL_BASE = pathlib.Path("/sys/class/powercap")
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+CGROUP_BASE = pathlib.Path("/sys/fs/cgroup")
+
+# eBPF program type -> readable label (uapi/linux/bpf.h)
+BPF_PROG_TYPES = {
+    1: "socket_filter",
+    2: "kprobe",
+    3: "sched_cls",
+    4: "sched_act",
+    5: "tracepoint",
+    6: "xdp",
+    7: "perf_event",
+    8: "cgroup_skb",
+    9: "cgroup_sock",
+    13: "sock_ops",
+    14: "sk_skb",
+    15: "cgroup_device",
+    16: "sk_msg",
+    17: "raw_tracepoint",
+    18: "cgroup_sock_addr",
+    24: "raw_tracepoint_writable",
+    26: "tracing",
+    27: "struct_ops",
+    28: "ext",
+    29: "lsm",
+    30: "sk_lookup",
+    31: "syscall",
+    32: "netfilter",
+}
+
+# shared with the benchmark thread
+_bench_lock = threading.Lock()
+_bench_results = {}  # op -> {"wall": s, "cpu": s, "ts": epoch}
+
+_bpf_stats_ok = False
+
+# baseline file, reloaded when its mtime changes
+_baseline = None
+_baseline_mtime = None
+
+
+def find_rapl_domain():
+    best = None
+    best_name = None
+    for path in RAPL_BASE.glob("intel-rapl:*"):
+        name = (path / "name").read_text().strip()
+        if name == "psys":
+            return path, name
+        if best is None:
+            best = path
+            best_name = name
+    return best, best_name
+
+
+def read_comm(stat_path, comm):
+    # comm in /proc/<pid>/stat is truncated to 15 characters. When it looks
+    # truncated, recover the full name from the basename of argv[0].
+    if len(comm) < 15:
+        return comm
+    try:
+        cmdline = (stat_path.parent / "cmdline").read_bytes()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return comm
+    arg0 = cmdline.split(b"\0", 1)[0]
+    if not arg0:
+        return comm
+    name = os.path.basename(os.fsdecode(arg0))
+    if name.startswith(comm):
+        return name
+    return comm
+
+
+def escape(value):
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def read_ctxt_switches(status_path):
+    vol = nonvol = 0
+    try:
+        for line in status_path.read_text().splitlines():
+            if line.startswith("voluntary_ctxt_switches:"):
+                vol = int(line.split()[1])
+            elif line.startswith("nonvoluntary_ctxt_switches:"):
+                nonvol = int(line.split()[1])
+    except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+        pass
+    return vol, nonvol
+
+
+def format_processes(lines):
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    by_comm = {}
+
+    for stat_path in pathlib.Path("/proc").glob("*/stat"):
+        try:
+            int(stat_path.parent.name)
+        except ValueError:
+            continue
+        try:
+            stat = stat_path.read_text()
+            i = stat.index("(")
+            j = stat.rindex(")")
+            comm = read_comm(stat_path, stat[i + 1 : j])
+            fields = stat[j + 2 :].split()
+            utime = int(fields[11])
+            stime = int(fields[12])
+            rss_pages = int(fields[21])
+
+            acc = by_comm.get(comm)
+            if acc is None:
+                # cpu, sys_cpu, rss, rchar, wchar, vcsw, nvcsw
+                acc = [0.0, 0.0, 0, 0, 0, 0, 0]
+                by_comm[comm] = acc
+            acc[0] += (utime + stime) / CLK_TCK
+            acc[1] += stime / CLK_TCK
+            acc[2] += rss_pages * page_size
+
+            try:
+                io_data = (stat_path.parent / "io").read_text()
+                for line in io_data.splitlines():
+                    k, _, v = line.partition(":")
+                    if k == "rchar":
+                        acc[3] += int(v)
+                    elif k == "wchar":
+                        acc[4] += int(v)
+            except (PermissionError, FileNotFoundError):
+                pass
+
+            vol, nonvol = read_ctxt_switches(stat_path.parent / "status")
+            acc[5] += vol
+            acc[6] += nonvol
+
+        except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
+            continue
+
+    lines.append(
+        "# HELP node_process_cpu_seconds_total "
+        "CPU time consumed by process group (user + system)."
+    )
+    lines.append("# TYPE node_process_cpu_seconds_total gauge")
+    lines.append(
+        "# HELP node_process_cpu_system_seconds_total "
+        "System (kernel) CPU time consumed by process group. This absorbs the "
+        "in-kernel cost of eBPF hooks triggered by the process's syscalls."
+    )
+    lines.append("# TYPE node_process_cpu_system_seconds_total gauge")
+    lines.append("# HELP node_process_memory_rss_bytes Resident set size in bytes.")
+    lines.append("# TYPE node_process_memory_rss_bytes gauge")
+    lines.append(
+        "# HELP node_process_io_bytes_total Bytes read/written by process group."
+    )
+    lines.append("# TYPE node_process_io_bytes_total gauge")
+    lines.append(
+        "# HELP node_process_ctxt_switches_total Context switches by process group."
+    )
+    lines.append("# TYPE node_process_ctxt_switches_total gauge")
+
+    for comm in sorted(by_comm):
+        cpu, sys_cpu, rss, rchar, wchar, vcsw, nvcsw = by_comm[comm]
+        label = f'comm="{escape(comm)}"'
+        lines.append(f"node_process_cpu_seconds_total{{{label}}} {cpu}")
+        lines.append(f"node_process_cpu_system_seconds_total{{{label}}} {sys_cpu}")
+        lines.append(f"node_process_memory_rss_bytes{{{label}}} {rss}")
+        lines.append(f'node_process_io_bytes_total{{{label},direction="read"}} {rchar}')
+        lines.append(
+            f'node_process_io_bytes_total{{{label},direction="write"}} {wchar}'
+        )
+        lines.append(
+            f'node_process_ctxt_switches_total{{{label},kind="voluntary"}} {vcsw}'
+        )
+        lines.append(
+            f'node_process_ctxt_switches_total{{{label},kind="nonvoluntary"}} {nvcsw}'
+        )
+    lines.append("")
+
+
+def format_bpf(lines):
+    lines.append(
+        "# HELP node_bpf_stats_enabled Whether eBPF run-time accounting is on."
+    )
+    lines.append("# TYPE node_bpf_stats_enabled gauge")
+    lines.append(f"node_bpf_stats_enabled {1 if _bpf_stats_ok else 0}")
+
+    if not _bpf_stats_ok:
+        lines.append("")
+        return
+
+    # aggregate by (name, type): identically named programs are the same hook
+    agg = {}
+    for prog in bpfstats.iter_progs():
+        key = (prog["name"], prog["type"])
+        run_time, run_cnt = agg.get(key, (0, 0))
+        agg[key] = (run_time + prog["run_time_ns"], run_cnt + prog["run_cnt"])
+
+    lines.append(
+        "# HELP node_bpf_prog_run_seconds_total "
+        "In-kernel CPU time consumed by eBPF programs (counter). This is the "
+        "sensor overhead otherwise hidden inside every process's system time."
+    )
+    lines.append("# TYPE node_bpf_prog_run_seconds_total counter")
+    lines.append(
+        "# HELP node_bpf_prog_run_count_total Number of eBPF program invocations."
+    )
+    lines.append("# TYPE node_bpf_prog_run_count_total counter")
+
+    for (name, ptype), (run_time, run_cnt) in sorted(agg.items()):
+        type_name = BPF_PROG_TYPES.get(ptype, f"type{ptype}")
+        label = f'name="{escape(name)}",type="{type_name}"'
+        lines.append(f"node_bpf_prog_run_seconds_total{{{label}}} {run_time / 1e9}")
+        lines.append(f"node_bpf_prog_run_count_total{{{label}}} {run_cnt}")
+    lines.append("")
+
+
+def format_cgroups(lines, cgroups):
+    emitted = False
+    for name, path in cgroups.items():
+        if not path.exists():
+            continue
+        if not emitted:
+            lines.append(
+                "# HELP node_cgroup_cpu_seconds_total CPU time consumed by cgroup."
+            )
+            lines.append("# TYPE node_cgroup_cpu_seconds_total counter")
+            lines.append(
+                "# HELP node_cgroup_memory_bytes Current memory usage of cgroup."
+            )
+            lines.append("# TYPE node_cgroup_memory_bytes gauge")
+            lines.append("# HELP node_cgroup_pids Current number of tasks in cgroup.")
+            lines.append("# TYPE node_cgroup_pids gauge")
+            emitted = True
+        label = f'cgroup="{escape(name)}"'
+        try:
+            for line in (path / "cpu.stat").read_text().splitlines():
+                k, _, v = line.partition(" ")
+                if k == "user_usec":
+                    lines.append(
+                        f'node_cgroup_cpu_seconds_total{{{label},mode="user"}} '
+                        f"{int(v) / 1e6}"
+                    )
+                elif k == "system_usec":
+                    lines.append(
+                        f'node_cgroup_cpu_seconds_total{{{label},mode="system"}} '
+                        f"{int(v) / 1e6}"
+                    )
+        except (FileNotFoundError, ValueError):
+            pass
+        try:
+            mem = int((path / "memory.current").read_text())
+            lines.append(f"node_cgroup_memory_bytes{{{label}}} {mem}")
+        except (FileNotFoundError, ValueError):
+            pass
+        try:
+            pids = int((path / "pids.current").read_text())
+            lines.append(f"node_cgroup_pids{{{label}}} {pids}")
+        except (FileNotFoundError, ValueError):
+            pass
+    if emitted:
+        lines.append("")
+
+
+def load_baseline(path):
+    global _baseline, _baseline_mtime
+    try:
+        mtime = path.stat().st_mtime
+    except FileNotFoundError:
+        _baseline = None
+        _baseline_mtime = None
+        return
+    if mtime != _baseline_mtime:
+        try:
+            _baseline = json.loads(path.read_text())
+            _baseline_mtime = mtime
+        except (OSError, ValueError):
+            _baseline = None
+
+
+def format_bench(lines, baseline_path):
+    with _bench_lock:
+        results = dict(_bench_results)
+
+    if results:
+        lines.append(
+            "# HELP node_syscall_bench_seconds "
+            "Measured per-call latency of a hooked/unhooked syscall (min of N)."
+        )
+        lines.append("# TYPE node_syscall_bench_seconds gauge")
+        lines.append("# HELP node_syscall_bench_cpu_seconds Per-call CPU time.")
+        lines.append("# TYPE node_syscall_bench_cpu_seconds gauge")
+        lines.append("# HELP node_syscall_bench_timestamp_seconds Last benchmark run.")
+        lines.append("# TYPE node_syscall_bench_timestamp_seconds gauge")
+        for op, r in sorted(results.items()):
+            label = f'op="{escape(op)}"'
+            lines.append(f"node_syscall_bench_seconds{{{label}}} {r['wall']}")
+            lines.append(f"node_syscall_bench_cpu_seconds{{{label}}} {r['cpu']}")
+            lines.append(f"node_syscall_bench_timestamp_seconds{{{label}}} {r['ts']}")
+        lines.append("")
+
+    load_baseline(baseline_path)
+    if _baseline is None:
+        return
+
+    lines.append(
+        "# HELP node_syscall_baseline_seconds "
+        "Baseline per-call syscall latency per EDR condition."
+    )
+    lines.append("# TYPE node_syscall_baseline_seconds gauge")
+    lines.append(
+        "# HELP node_syscall_baseline_overhead_seconds "
+        "Per-call syscall latency attributable to the EDR sensors (all_on - no_edr)."
+    )
+    lines.append("# TYPE node_syscall_baseline_overhead_seconds gauge")
+    lines.append(
+        "# HELP node_syscall_baseline_stale "
+        "1 if the running kernel no longer matches the captured baseline."
+    )
+    lines.append("# TYPE node_syscall_baseline_stale gauge")
+
+    for cond, ops in _baseline.get("conditions_ns", {}).items():
+        for op, ns in ops.items():
+            if ns is None:
+                continue
+            label = f'op="{escape(op)}",condition="{escape(cond)}"'
+            lines.append(f"node_syscall_baseline_seconds{{{label}}} {ns / 1e9}")
+    for op, ns in _baseline.get("overhead_ns", {}).items():
+        if ns is None:
+            continue
+        lines.append(
+            f'node_syscall_baseline_overhead_seconds{{op="{escape(op)}"}} {ns / 1e9}'
+        )
+    stale = 1 if _baseline.get("kernel") != os.uname().release else 0
+    lines.append(f"node_syscall_baseline_stale {stale}")
+    lines.append("")
+
+
+def format_metrics(rapl_path, cgroups, baseline_path):
+    lines = []
+
+    energy_uj = int((rapl_path / "energy_uj").read_text())
+    lines.append(
+        "# HELP node_rapl_energy_joules "
+        "Total energy consumed reported by RAPL (counter)."
+    )
+    lines.append("# TYPE node_rapl_energy_joules counter")
+    lines.append(f"node_rapl_energy_joules {energy_uj / 1_000_000}")
+    lines.append("")
+
+    format_processes(lines)
+    format_bpf(lines)
+    format_cgroups(lines, cgroups)
+    format_bench(lines, baseline_path)
+
+    return "\n".join(lines) + "\n"
+
+
+def bench_loop(binary, ops, cpu, interval, repeats):
+    while True:
+        for op in ops:
+            wall = cpu_ns = None
+            for _ in range(repeats):
+                try:
+                    cmd = [binary, op]
+                    if cpu is not None:
+                        cmd += ["-c", str(cpu)]
+                    out = subprocess.run(
+                        cmd, capture_output=True, text=True, check=True
+                    ).stdout
+                    data = json.loads(out)
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    continue
+                w = data["wall_ns"] / 1e9
+                c = data["cpu_ns"] / 1e9
+                wall = w if wall is None else min(wall, w)
+                cpu_ns = c if cpu_ns is None else min(cpu_ns, c)
+            if wall is not None:
+                with _bench_lock:
+                    _bench_results[op] = {
+                        "wall": wall,
+                        "cpu": cpu_ns,
+                        "ts": time.time(),
+                    }
+        time.sleep(interval)
+
+
+class MetricsHandler(http.server.BaseHTTPRequestHandler):
+    rapl_path = None
+    cgroups = {}
+    baseline_path = None
+
+    def do_GET(self):
+        body = format_metrics(self.rapl_path, self.cgroups, self.baseline_path).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Per-process power consumption Prometheus exporter"
+    )
+    p.add_argument(
+        "-p", "--port", type=int, default=9599, help="listen port (default: 9599)"
+    )
+    p.add_argument(
+        "--cgroup-services",
+        default="falcon-sensor,osqueryd,orbit",
+        help="system.slice services to report cgroup stats for",
+    )
+    p.add_argument(
+        "--bench-binary",
+        default="/usr/local/bin/syscall-bench",
+        help="syscall benchmark binary (disabled if missing)",
+    )
+    p.add_argument("--bench-ops", default="getpid,openat,execve")
+    p.add_argument(
+        "--bench-cpu",
+        type=int,
+        default=None,
+        help="pin benchmark to this CPU (keep it off isolated/DPDK cores)",
+    )
+    p.add_argument(
+        "--bench-interval", type=int, default=900, help="seconds between bench runs"
+    )
+    p.add_argument("--bench-repeats", type=int, default=5)
+    p.add_argument(
+        "--baseline",
+        default="/var/lib/power-exporter/syscall-baseline.json",
+        help="baseline file produced by capture-baseline.py",
+    )
+    p.add_argument(
+        "--no-bpf-stats",
+        action="store_true",
+        help="do not enable eBPF run-time accounting",
+    )
+    args = p.parse_args()
+
+    rapl_path, rapl_name = find_rapl_domain()
+    if not rapl_path:
+        raise SystemExit("error: no RAPL domain found")
+    print(f"using RAPL domain: {rapl_name} ({rapl_path})")
+
+    global _bpf_stats_ok
+    if not args.no_bpf_stats:
+        fd = bpfstats.enable_stats()
+        if fd is None:
+            print("warning: could not enable eBPF run-time stats (need root/CAP_BPF)")
+        else:
+            _bpf_stats_ok = True
+            # keep the fd for the whole process lifetime; stats auto-disable on exit
+            MetricsHandler._bpf_stats_fd = fd
+            print("eBPF run-time stats enabled")
+
+    cgroups = {
+        svc: CGROUP_BASE / "system.slice" / f"{svc}.service"
+        for svc in args.cgroup_services.split(",")
+        if svc
+    }
+    MetricsHandler.rapl_path = rapl_path
+    MetricsHandler.cgroups = cgroups
+    MetricsHandler.baseline_path = pathlib.Path(args.baseline)
+
+    ops = [o for o in args.bench_ops.split(",") if o]
+    if ops and pathlib.Path(args.bench_binary).exists():
+        t = threading.Thread(
+            target=bench_loop,
+            args=(
+                args.bench_binary,
+                ops,
+                args.bench_cpu,
+                args.bench_interval,
+                args.bench_repeats,
+            ),
+            daemon=True,
+        )
+        t.start()
+        print(f"syscall benchmark running every {args.bench_interval}s: {ops}")
+    else:
+        print(f"syscall benchmark disabled (no binary at {args.bench_binary})")
+
+    server = http.server.HTTPServer(("", args.port), MetricsHandler)
+    print(f"listening on :{args.port}/metrics", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

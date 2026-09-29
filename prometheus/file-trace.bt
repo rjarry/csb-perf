@@ -1,0 +1,192 @@
+/*
+ * Trace file access patterns via eBPF.
+ *
+ * Usage: bpftrace file-trace.bt <tgid>
+ *
+ * Logs every file opened/read/written and every stat/readdir call made by
+ * a process and all its worker threads. Read/write bytes are accumulated per
+ * fd and reported on close(). Files opened but never read/written are ignored.
+ *
+ * Output format:
+ *   2026-08-21 18:59:22 open(/proc/1234/stat) read(318)
+ *   2026-08-21 18:59:22 stat(/etc/resolv.conf)
+ *   2026-08-21 18:59:22 readdir(/proc) bytes(4096)
+ *
+ * $1 is the tgid (process id) of the traced process. bpftrace's "pid" builtin
+ * is actually the tgid, so /pid == $1/ matches all threads in the process.
+ */
+
+/* Save filename on openat() entry, keyed by thread id */
+tracepoint:syscalls:sys_enter_openat
+/pid == $1/
+{
+	@open_arg[tid] = args.filename;
+}
+
+/* On openat() return, map fd to its path for later read/write tracking.
+ * Cast to uint64 because args.ret is signed (can be -errno). */
+tracepoint:syscalls:sys_exit_openat
+/pid == $1/
+{
+	if (@open_arg[tid]) {
+		if (args.ret >= 0) {
+			$fd = (uint64)args.ret;
+			@fd_path[pid, $fd] = str(@open_arg[tid]);
+			@fd_tracked[pid, $fd] = 1;
+		}
+		delete(@open_arg[tid]);
+	}
+}
+
+tracepoint:syscalls:sys_enter_newfstatat
+/pid == $1/
+{
+	@stat_arg[tid] = args.filename;
+}
+
+tracepoint:syscalls:sys_exit_newfstatat
+/pid == $1/
+{
+	if (@stat_arg[tid]) {
+		if (args.ret >= 0) {
+			printf("%s stat(%s)\n",
+				strftime("%Y-%m-%d %H:%M:%S", nsecs),
+				str(@stat_arg[tid]));
+		}
+		delete(@stat_arg[tid]);
+	}
+}
+
+tracepoint:syscalls:sys_enter_statx
+/pid == $1/
+{
+	@statx_arg[tid] = args.filename;
+}
+
+tracepoint:syscalls:sys_exit_statx
+/pid == $1/
+{
+	if (@statx_arg[tid]) {
+		if (args.ret >= 0) {
+			printf("%s stat(%s)\n",
+				strftime("%Y-%m-%d %H:%M:%S", nsecs),
+				str(@statx_arg[tid]));
+		}
+		delete(@statx_arg[tid]);
+	}
+}
+
+/* Track directory listings. getdents64 returns a buffer of variable-length
+ * dirent structs; we can only report total bytes, not entry count. */
+tracepoint:syscalls:sys_enter_getdents64
+/pid == $1/
+{
+	$fd = (uint64)args.fd;
+	if (@fd_tracked[pid, $fd]) {
+		@getdents_fd[tid] = $fd;
+	}
+}
+
+tracepoint:syscalls:sys_exit_getdents64
+/pid == $1/
+{
+	if (@getdents_fd[tid]) {
+		if (args.ret > 0) {
+			@getdents_bytes[pid, @getdents_fd[tid]] += (uint64)args.ret;
+		}
+		delete(@getdents_fd[tid]);
+	}
+}
+
+/* For read/write, we need to save the fd on sys_enter (the sys_exit
+ * tracepoint does not carry the original fd argument). Only track fds
+ * that were opened via our openat hook. */
+tracepoint:syscalls:sys_enter_read
+/pid == $1/
+{
+	$fd = (uint64)args.fd;
+	if (@fd_tracked[pid, $fd]) {
+		@read_fd[tid] = $fd;
+	}
+}
+
+tracepoint:syscalls:sys_exit_read
+/pid == $1/
+{
+	if (@read_fd[tid]) {
+		if (args.ret > 0) {
+			@read_bytes[pid, @read_fd[tid]] += (uint64)args.ret;
+		}
+		delete(@read_fd[tid]);
+	}
+}
+
+tracepoint:syscalls:sys_enter_write
+/pid == $1/
+{
+	$fd = (uint64)args.fd;
+	if (@fd_tracked[pid, $fd]) {
+		@write_fd[tid] = $fd;
+	}
+}
+
+tracepoint:syscalls:sys_exit_write
+/pid == $1/
+{
+	if (@write_fd[tid]) {
+		if (args.ret > 0) {
+			@write_bytes[pid, @write_fd[tid]] += (uint64)args.ret;
+		}
+		delete(@write_fd[tid]);
+	}
+}
+
+/* On close(), emit the accumulated stats and clean up.
+ * Guard all deletes to avoid "map element does not exist" warnings. */
+tracepoint:syscalls:sys_enter_close
+/pid == $1/
+{
+	$fd = (uint64)args.fd;
+	if (@fd_tracked[pid, $fd]) {
+		$r = @read_bytes[pid, $fd];
+		$w = @write_bytes[pid, $fd];
+		$d = @getdents_bytes[pid, $fd];
+		if ($d > 0) {
+			printf("%s readdir(%s) bytes(%lld)\n",
+				strftime("%Y-%m-%d %H:%M:%S", nsecs),
+				@fd_path[pid, $fd], $d);
+		} else if ($r > 0 && $w > 0) {
+			printf("%s open(%s) read(%lld) write(%lld)\n",
+				strftime("%Y-%m-%d %H:%M:%S", nsecs),
+				@fd_path[pid, $fd], $r, $w);
+		} else if ($r > 0) {
+			printf("%s open(%s) read(%lld)\n",
+				strftime("%Y-%m-%d %H:%M:%S", nsecs),
+				@fd_path[pid, $fd], $r);
+		} else if ($w > 0) {
+			printf("%s open(%s) write(%lld)\n",
+				strftime("%Y-%m-%d %H:%M:%S", nsecs),
+				@fd_path[pid, $fd], $w);
+		}
+		delete(@fd_tracked[pid, $fd]);
+		delete(@fd_path[pid, $fd]);
+		if ($r) { delete(@read_bytes[pid, $fd]); }
+		if ($w) { delete(@write_bytes[pid, $fd]); }
+		if ($d) { delete(@getdents_bytes[pid, $fd]); }
+	}
+}
+
+END
+{
+	clear(@open_arg);
+	clear(@stat_arg);
+	clear(@statx_arg);
+	clear(@read_fd);
+	clear(@write_fd);
+	clear(@fd_tracked);
+	clear(@fd_path);
+	clear(@read_bytes);
+	clear(@write_bytes);
+	clear(@getdents_fd);
+	clear(@getdents_bytes);
+}

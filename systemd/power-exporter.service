@@ -1,0 +1,13 @@
+[Unit]
+Description=Per-process power consumption Prometheus exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /etc/prometheus/power-exporter.py
+Restart=on-failure
+SyslogIdentifier=power-exporter.py
+StateDirectory=power-exporter
+
+[Install]
+WantedBy=multi-user.target

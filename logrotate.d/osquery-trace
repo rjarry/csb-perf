@@ -1,0 +1,12 @@
+/var/log/osquery-trace.log {
+	daily
+	rotate 7
+	missingok
+	notifempty
+	compress
+	delaycompress
+	# systemd holds the log fd open (StandardOutput=append), so truncate in
+	# place rather than renaming, which the running process would keep writing
+	# to under the old name.
+	copytruncate
+}
