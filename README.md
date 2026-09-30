@@ -152,9 +152,31 @@ it imports `bpfstats` from the same directory.)
   measurement. Keep iteration counts small and the interval long (defaults do);
   per-call `min` latency stays valid and the average footprint is negligible.
 
-- **EDR alerting.** A tight `execve` loop can look like a fork-bomb to the
-  sensor. Allowlist the `syscall-bench` binary, or run only
-  `--bench-ops getpid,openat`.
+- **EDR alerting, and how to allowlist without skewing the result.** The
+  `execve` benchmark is a tight `fork()` + `execve("/usr/bin/true")` loop
+  (~2,200 process spawns per run, which the exporter repeats five times every
+  15 minutes). To a behavioural sensor that looks like a fork-bomb or mass
+  process creation, which can page your SOC, get the benchmark throttled or
+  killed by the prevention policy, and corrupt the sample if the sensor steps
+  in mid-run. `syscall-bench` uses a distinct binary name on purpose, so a
+  rule is easy to target.
+
+  To silence it, have whoever administers the Falcon tenant add an *exclusion*
+  for the binary, by path (`/usr/local/bin/syscall-bench`) or SHA-256 hash; on
+  a managed CSB you usually cannot do this yourself. Ask specifically for a
+  **detection/prevention exclusion** (Falcon's IOA / ML exclusions) that
+  suppresses the *alert* while the eBPF programs keep running. Do **not**
+  accept a *sensor visibility exclusion*: it reduces monitoring of the binary
+  and makes the "sensor on" measurement artificially cheap, under-reporting
+  the overhead you are trying to quantify. The goal is to stop the sensor
+  crying wolf about this process, not to stop it watching it.
+
+  If you cannot get an exclusion added, drop the op instead:
+  `--bench-ops getpid,openat`. Those never spawn a process, so nothing looks
+  like a fork-bomb and there is nothing to allowlist; you lose the
+  process-spawn latency but keep file-open latency, where most of the compile
+  tax lives. This caveat applies to the microbenchmark only: `compile-ab.py`
+  runs real builds and needs no allowlisting.
 
 - **Pinning.** Pin the benchmark (`taskset -c <cpu>`) to a housekeeping core,
   never an isolated/DPDK core.
