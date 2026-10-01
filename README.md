@@ -32,6 +32,7 @@ Two things make it visible again:
 | `syscall-bench.c` | `syscall-bench`: measures per-call latency of `getpid`/`openat`/`execve`. Distinct binary name for EDR allowlisting; optional CPU pinning. |
 | `prometheus/capture-baseline.py` | Captures the no-EDR baseline (A/B/A, with BPF-detach verification). |
 | `prometheus/compile-ab.py` | A/B benchmark of a *real* build with the sensors ON vs momentarily OFF (falcon eBPF-detach verified). Reports the per-build wall-clock, kernel-CPU, energy and eBPF deltas. Project-agnostic. |
+| `prometheus/idle-ab.py` | Idle A/B: fan RPM, package temperature, interrupt + eBPF rates and power with the sensors ON vs momentarily OFF. Shows the sensors keep an idle machine (and its fan) busy. |
 | `prometheus/file-trace.bt` | bpftrace script logging a process's file access (open/read/write/stat/readdir). Used to see *what* osquery touches. |
 | `prometheus/prometheus.yml` | Prometheus scrape config (self + exporter on :9599). |
 | `grafana/dashboards/power.json` | Grafana dashboard. |
@@ -145,6 +146,22 @@ wall-clock   ON 17.96s   OFF 14.53s
 
 (Run it uninstalled with `sudo ./prometheus/compile-ab.py --workdir <project>`;
 it imports `bpfstats` from the same directory.)
+
+## Idle A/B (fan / power)
+
+`idle-ab.py` answers a different question: why does the fan run when the machine
+is doing nothing? Close everything but the terminal running it, then:
+
+```sh
+sudo /etc/prometheus/idle-ab.py
+```
+
+It records fan RPM, package temperature, interrupt rate, eBPF activity and power
+with the sensors ON, stops them (verifying eBPF actually went quiet), measures
+again over a longer window so the fan has time to react, and restores on exit.
+Expect the eBPF event rate to collapse (tens of thousands/s to tens/s) and, a few
+seconds later, the fan to spin down — then ramp back when the services restart.
+Results are written to `/var/lib/power-exporter/idle-ab.json`.
 
 ## Benchmark caveats
 
