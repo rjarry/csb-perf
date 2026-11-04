@@ -33,7 +33,11 @@ test times a full `git worktree add --detach ... HEAD && git worktree remove`
 cycle.
 
 Reports per-run medians and the ON-OFF delta in wall-clock, kernel CPU, energy
-and eBPF run-time, then projects the daily/annual time lost.
+and eBPF run-time, then projects the daily/annual time lost. For the ON runs it
+also reports falcon-sensor's own cost: the CPU and resident memory of its
+service cgroup during each run, and a CPU-time-proportional share of the package
+energy (counting both the sensor daemon's CPU and the in-kernel eBPF run-time
+its hooks add to git's syscalls).
 
 Must run as root (service control, cgroups, eBPF stats). git itself runs as
 --user so it does not create root-owned files.
@@ -58,6 +62,7 @@ import bpfstats
 RAPL_BASE = pathlib.Path("/sys/class/powercap")
 CPUFREQ = pathlib.Path("/sys/devices/system/cpu")
 CGROUP_BASE = pathlib.Path("/sys/fs/cgroup")
+CLK_TCK = os.sysconf("SC_CLK_TCK")
 
 
 def find_rapl():
@@ -84,6 +89,39 @@ def energy_wrap(rapl):
 
 def bpf_runtime_ns():
     return sum(p["run_time_ns"] for p in bpfstats.iter_progs())
+
+
+def read_total_cpu_s():
+    with open("/proc/stat") as f:
+        v = [int(x) for x in f.readline().split()[1:]]
+    # user + nice + system + irq + softirq + steal (idle/iowait excluded;
+    # guest/guest_nice are already folded into user/nice)
+    busy = v[0] + v[1] + v[2] + v[5] + v[6]
+    if len(v) > 7:
+        busy += v[7]
+    return busy / CLK_TCK
+
+
+def read_cgroup_cpu_s(cg):
+    # cumulative user+system CPU-seconds charged to a cgroup, or None
+    try:
+        user_us = sys_us = 0
+        for line in (cg / "cpu.stat").read_text().splitlines():
+            k, _, val = line.partition(" ")
+            if k == "user_usec":
+                user_us = int(val)
+            elif k == "system_usec":
+                sys_us = int(val)
+        return (user_us + sys_us) / 1e6
+    except (OSError, ValueError):
+        return None
+
+
+def read_cgroup_mem(cg):
+    try:
+        return int((cg / "memory.current").read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def falcon_prog_ids(comm):
@@ -238,7 +276,7 @@ def ensure_repo(path, url, user, base):
         raise SystemExit(f"setup clone failed:\n{c.stderr[-2000:]}")
 
 
-def measure_cmd(cmd, dirty_cmd, user, cwd, rapl, wrap):
+def measure_cmd(cmd, dirty_cmd, user, cwd, rapl, wrap, sensor_cg):
     # dirty step is not part of the measurement
     if dirty_cmd and dirty_cmd.strip():
         d = run_user(dirty_cmd, user, cwd)
@@ -270,6 +308,9 @@ def measure_cmd(cmd, dirty_cmd, user, cwd, rapl, wrap):
         f"cd {shlex.quote(cwd)} && {cmd}",
     ]
 
+    sc0 = read_cgroup_cpu_s(sensor_cg) if sensor_cg else None
+    sm0 = read_cgroup_mem(sensor_cg) if sensor_cg else None
+    ct0 = read_total_cpu_s()
     e0 = read_energy_uj(rapl)
     b0 = bpf_runtime_ns()
     t0 = time.monotonic()
@@ -279,6 +320,9 @@ def measure_cmd(cmd, dirty_cmd, user, cwd, rapl, wrap):
     t1 = time.monotonic()
     b1 = bpf_runtime_ns()
     e1 = read_energy_uj(rapl)
+    ct1 = read_total_cpu_s()
+    sc1 = read_cgroup_cpu_s(sensor_cg) if sensor_cg else None
+    sm1 = read_cgroup_mem(sensor_cg) if sensor_cg else None
 
     user_s = sys_s = peak = None
     if cg is not None:
@@ -305,6 +349,23 @@ def measure_cmd(cmd, dirty_cmd, user, cwd, rapl, wrap):
     de = e1 - e0
     if wrap and de < 0:
         de += wrap
+    energy_j = de / 1e6
+    ebpf_s = (b1 - b0) / 1e9
+
+    # falcon-sensor's own cost during the run: CPU and memory from its service
+    # cgroup, plus a CPU-time-proportional share of the package energy. The
+    # share counts the sensor daemon's CPU and the in-kernel eBPF run-time its
+    # hooks burn inside git's syscalls. All None for OFF runs (cgroup is gone).
+    sensor_cpu_s = sensor_rss = sensor_energy_j = None
+    if sc0 is not None and sc1 is not None:
+        sensor_cpu_s = sc1 - sc0
+    mems = [m for m in (sm0, sm1) if m is not None]
+    if mems:
+        sensor_rss = max(mems)
+    total_cpu_s = ct1 - ct0
+    if sensor_cpu_s is not None and total_cpu_s > 0:
+        sensor_energy_j = energy_j * (sensor_cpu_s + ebpf_s) / total_cpu_s
+
     return {
         "rc": p.returncode,
         "err": (p.stderr or "")[-800:] if p.returncode else "",
@@ -312,8 +373,11 @@ def measure_cmd(cmd, dirty_cmd, user, cwd, rapl, wrap):
         "user_s": user_s,
         "sys_s": sys_s,
         "peak_rss": peak,
-        "energy_j": de / 1e6,
-        "ebpf_s": (b1 - b0) / 1e9,
+        "energy_j": energy_j,
+        "ebpf_s": ebpf_s,
+        "sensor_cpu_s": sensor_cpu_s,
+        "sensor_rss": sensor_rss,
+        "sensor_energy_j": sensor_energy_j,
     }
 
 
@@ -326,7 +390,7 @@ def fmt(x, u="", n=1):
     return f"{x:.{n}f}{u}" if x is not None else "n/a"
 
 
-def measure_reps(spec, state, user, rapl, wrap, ebpf_off_max):
+def measure_reps(spec, state, user, rapl, wrap, ebpf_off_max, sensor_cg):
     # Run every repetition of one test with the sensor in its current state
     # ("ON" or "OFF"). The caller toggles the sensor once around the whole batch
     # of tests, not here. OFF runs whose eBPF run-time exceeds ebpf_off_max are
@@ -337,7 +401,9 @@ def measure_reps(spec, state, user, rapl, wrap, ebpf_off_max):
     discarded = 0
     for rep in range(reps):
         print(f"\n=== {name} {state} rep {rep + 1}/{reps} ===", file=sys.stderr)
-        m = measure_cmd(spec["cmd"], spec["dirty"], user, spec["cwd"], rapl, wrap)
+        m = measure_cmd(
+            spec["cmd"], spec["dirty"], user, spec["cwd"], rapl, wrap, sensor_cg
+        )
         if m.get("rc", 1) != 0:
             print(f"  {state} run failed: {m.get('err','')}", file=sys.stderr)
             continue
@@ -350,10 +416,16 @@ def measure_reps(spec, state, user, rapl, wrap, ebpf_off_max):
             )
             continue
         runs.append(m)
+        extra = ""
+        if m.get("sensor_cpu_s") is not None:
+            extra = (
+                f" sensorCPU={fmt(m['sensor_cpu_s'],'s',2)} "
+                f"sensorE={fmt(m['sensor_energy_j'],'J',1)}"
+            )
         print(
             f"  {state:<3}: wall={fmt(m['wall_s'],'s',2)} "
             f"sys={fmt(m['sys_s'],'s',1)} ebpf={fmt(m['ebpf_s'],'s',2)} "
-            f"E={fmt(m['energy_j'],'J',0)}",
+            f"E={fmt(m['energy_j'],'J',0)}{extra}",
             file=sys.stderr,
         )
     return runs, discarded
@@ -363,7 +435,17 @@ def summarize(on_runs, off_runs, discarded):
     def agg(runs, key):
         return med([r[key] for r in runs])
 
-    keys = ("wall_s", "user_s", "sys_s", "energy_j", "ebpf_s", "peak_rss")
+    keys = (
+        "wall_s",
+        "user_s",
+        "sys_s",
+        "energy_j",
+        "ebpf_s",
+        "peak_rss",
+        "sensor_cpu_s",
+        "sensor_rss",
+        "sensor_energy_j",
+    )
     return {
         "reps_on": len(on_runs),
         "reps_off": len(off_runs),
@@ -414,6 +496,14 @@ def print_report(name, s, ops_per_day):
         f"eBPF CPU     ON {fmt(on['ebpf_s'],'s',2)}   "
         f"OFF {fmt(off['ebpf_s'],'s',2)} (should be ~0)"
     )
+    sc, sr, se = on["sensor_cpu_s"], on["sensor_rss"], on["sensor_energy_j"]
+    if any(v is not None for v in (sc, sr, se)):
+        rss_mb = sr / 1e6 if sr is not None else None
+        print(
+            f"falcon-sensor own cost (ON): "
+            f"CPU {fmt(sc,'s',2)}   RSS {fmt(rss_mb,'MB',0)}   "
+            f"energy {fmt(se,'J',1)} per run"
+        )
 
 
 class HelpFormatter(
@@ -531,6 +621,11 @@ examples:
     falcon = [s for s in args.falcon_services.split(",") if s]
     others = [s for s in args.other_services.split(",") if s]
     paused = [s for s in args.pause_services.split(",") if s]
+    # service cgroup whose CPU/memory/energy is attributed to the sensor during
+    # ON runs (derived from the primary falcon service)
+    sensor_cg = (
+        CGROUP_BASE / "system.slice" / f"{falcon[0]}.service" if falcon else None
+    )
 
     rapl = find_rapl()
     if not rapl:
@@ -649,9 +744,15 @@ examples:
             )
             if ok:
                 print(f"\nsensor ON ({n_on} eBPF progs loaded)", file=sys.stderr)
+                if sensor_cg is not None and not sensor_cg.exists():
+                    print(
+                        f"warning: sensor cgroup {sensor_cg} not found; "
+                        "its CPU/RSS/energy will be n/a",
+                        file=sys.stderr,
+                    )
                 for t in tests:
                     on_runs[t["name"]], _ = measure_reps(
-                        t, "ON", user, rapl, wrap, args.ebpf_off_max
+                        t, "ON", user, rapl, wrap, args.ebpf_off_max, sensor_cg
                     )
             else:
                 print(
@@ -673,7 +774,7 @@ examples:
                 try:
                     for t in tests:
                         off_runs[t["name"]], discarded[t["name"]] = measure_reps(
-                            t, "OFF", user, rapl, wrap, args.ebpf_off_max
+                            t, "OFF", user, rapl, wrap, args.ebpf_off_max, sensor_cg
                         )
                 finally:
                     # restore the sensor once, after every OFF run
