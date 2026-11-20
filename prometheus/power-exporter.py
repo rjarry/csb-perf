@@ -2,12 +2,8 @@
 
 import argparse
 import http.server
-import json
 import os
 import pathlib
-import subprocess
-import threading
-import time
 
 import bpfstats
 
@@ -42,15 +38,7 @@ BPF_PROG_TYPES = {
     32: "netfilter",
 }
 
-# shared with the benchmark thread
-_bench_lock = threading.Lock()
-_bench_results = {}  # op -> {"wall": s, "cpu": s, "ts": epoch}
-
 _bpf_stats_ok = False
-
-# baseline file, reloaded when its mtime changes
-_baseline = None
-_baseline_mtime = None
 
 
 def find_rapl_domain():
@@ -272,81 +260,7 @@ def format_cgroups(lines, cgroups):
         lines.append("")
 
 
-def load_baseline(path):
-    global _baseline, _baseline_mtime
-    try:
-        mtime = path.stat().st_mtime
-    except FileNotFoundError:
-        _baseline = None
-        _baseline_mtime = None
-        return
-    if mtime != _baseline_mtime:
-        try:
-            _baseline = json.loads(path.read_text())
-            _baseline_mtime = mtime
-        except (OSError, ValueError):
-            _baseline = None
-
-
-def format_bench(lines, baseline_path):
-    with _bench_lock:
-        results = dict(_bench_results)
-
-    if results:
-        lines.append(
-            "# HELP node_syscall_bench_seconds "
-            "Measured per-call latency of a hooked/unhooked syscall (min of N)."
-        )
-        lines.append("# TYPE node_syscall_bench_seconds gauge")
-        lines.append("# HELP node_syscall_bench_cpu_seconds Per-call CPU time.")
-        lines.append("# TYPE node_syscall_bench_cpu_seconds gauge")
-        lines.append("# HELP node_syscall_bench_timestamp_seconds Last benchmark run.")
-        lines.append("# TYPE node_syscall_bench_timestamp_seconds gauge")
-        for op, r in sorted(results.items()):
-            label = f'op="{escape(op)}"'
-            lines.append(f"node_syscall_bench_seconds{{{label}}} {r['wall']}")
-            lines.append(f"node_syscall_bench_cpu_seconds{{{label}}} {r['cpu']}")
-            lines.append(f"node_syscall_bench_timestamp_seconds{{{label}}} {r['ts']}")
-        lines.append("")
-
-    load_baseline(baseline_path)
-    if _baseline is None:
-        return
-
-    lines.append(
-        "# HELP node_syscall_baseline_seconds "
-        "Baseline per-call syscall latency per EDR condition."
-    )
-    lines.append("# TYPE node_syscall_baseline_seconds gauge")
-    lines.append(
-        "# HELP node_syscall_baseline_overhead_seconds "
-        "Per-call syscall latency attributable to the EDR sensors (all_on - no_edr)."
-    )
-    lines.append("# TYPE node_syscall_baseline_overhead_seconds gauge")
-    lines.append(
-        "# HELP node_syscall_baseline_stale "
-        "1 if the running kernel no longer matches the captured baseline."
-    )
-    lines.append("# TYPE node_syscall_baseline_stale gauge")
-
-    for cond, ops in _baseline.get("conditions_ns", {}).items():
-        for op, ns in ops.items():
-            if ns is None:
-                continue
-            label = f'op="{escape(op)}",condition="{escape(cond)}"'
-            lines.append(f"node_syscall_baseline_seconds{{{label}}} {ns / 1e9}")
-    for op, ns in _baseline.get("overhead_ns", {}).items():
-        if ns is None:
-            continue
-        lines.append(
-            f'node_syscall_baseline_overhead_seconds{{op="{escape(op)}"}} {ns / 1e9}'
-        )
-    stale = 1 if _baseline.get("kernel") != os.uname().release else 0
-    lines.append(f"node_syscall_baseline_stale {stale}")
-    lines.append("")
-
-
-def format_metrics(rapl_path, cgroups, baseline_path):
+def format_metrics(rapl_path, cgroups):
     lines = []
 
     energy_uj = int((rapl_path / "energy_uj").read_text())
@@ -361,47 +275,16 @@ def format_metrics(rapl_path, cgroups, baseline_path):
     format_processes(lines)
     format_bpf(lines)
     format_cgroups(lines, cgroups)
-    format_bench(lines, baseline_path)
 
     return "\n".join(lines) + "\n"
-
-
-def bench_loop(binary, ops, cpu, interval, repeats):
-    while True:
-        for op in ops:
-            wall = cpu_ns = None
-            for _ in range(repeats):
-                try:
-                    cmd = [binary, op]
-                    if cpu is not None:
-                        cmd += ["-c", str(cpu)]
-                    out = subprocess.run(
-                        cmd, capture_output=True, text=True, check=True
-                    ).stdout
-                    data = json.loads(out)
-                except (OSError, subprocess.SubprocessError, ValueError):
-                    continue
-                w = data["wall_ns"] / 1e9
-                c = data["cpu_ns"] / 1e9
-                wall = w if wall is None else min(wall, w)
-                cpu_ns = c if cpu_ns is None else min(cpu_ns, c)
-            if wall is not None:
-                with _bench_lock:
-                    _bench_results[op] = {
-                        "wall": wall,
-                        "cpu": cpu_ns,
-                        "ts": time.time(),
-                    }
-        time.sleep(interval)
 
 
 class MetricsHandler(http.server.BaseHTTPRequestHandler):
     rapl_path = None
     cgroups = {}
-    baseline_path = None
 
     def do_GET(self):
-        body = format_metrics(self.rapl_path, self.cgroups, self.baseline_path).encode()
+        body = format_metrics(self.rapl_path, self.cgroups).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4")
         self.send_header("Content-Length", str(len(body)))
@@ -423,27 +306,6 @@ def main():
         "--cgroup-services",
         default="falcon-sensor,osqueryd,orbit",
         help="system.slice services to report cgroup stats for",
-    )
-    p.add_argument(
-        "--bench-binary",
-        default="/usr/local/bin/syscall-bench",
-        help="syscall benchmark binary (disabled if missing)",
-    )
-    p.add_argument("--bench-ops", default="getpid,openat,execve")
-    p.add_argument(
-        "--bench-cpu",
-        type=int,
-        default=None,
-        help="pin benchmark to this CPU (keep it off isolated/DPDK cores)",
-    )
-    p.add_argument(
-        "--bench-interval", type=int, default=900, help="seconds between bench runs"
-    )
-    p.add_argument("--bench-repeats", type=int, default=5)
-    p.add_argument(
-        "--baseline",
-        default="/var/lib/power-exporter/syscall-baseline.json",
-        help="baseline file produced by capture-baseline.py",
     )
     p.add_argument(
         "--no-bpf-stats",
@@ -475,25 +337,6 @@ def main():
     }
     MetricsHandler.rapl_path = rapl_path
     MetricsHandler.cgroups = cgroups
-    MetricsHandler.baseline_path = pathlib.Path(args.baseline)
-
-    ops = [o for o in args.bench_ops.split(",") if o]
-    if ops and pathlib.Path(args.bench_binary).exists():
-        t = threading.Thread(
-            target=bench_loop,
-            args=(
-                args.bench_binary,
-                ops,
-                args.bench_cpu,
-                args.bench_interval,
-                args.bench_repeats,
-            ),
-            daemon=True,
-        )
-        t.start()
-        print(f"syscall benchmark running every {args.bench_interval}s: {ops}")
-    else:
-        print(f"syscall benchmark disabled (no binary at {args.bench_binary})")
 
     server = http.server.HTTPServer(("", args.port), MetricsHandler)
     print(f"listening on :{args.port}/metrics", flush=True)

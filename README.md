@@ -18,19 +18,16 @@ Two things make it visible again:
   program exposes `run_time_ns` and `run_cnt`. Summed, that is the in-kernel
   CPU time the sensor actually burns.
 
-- **A/B syscall benchmark.** A fixed micro-benchmark of hooked (`openat`,
-  `execve`) vs essentially-unhooked (`getpid`) syscalls, compared against
-  a baseline captured with the sensor momentarily disabled, yields the per-call
-  latency tax and hence the "time lost" on syscall-heavy work.
+- **A/B benchmarks of real workloads.** The same build, or the same idle
+  window, with the sensors ON vs momentarily OFF, yields the wall-clock and
+  power cost as developers actually feel it.
 
 ## Components
 
 | Path | Purpose |
 | --- | --- |
-| `prometheus/power-exporter.py` | Prometheus exporter: per-process CPU/mem/IO, RAPL energy, eBPF program run-time, cgroup stats for the sensors, syscall-benchmark + baseline metrics. |
+| `prometheus/power-exporter.py` | Prometheus exporter: per-process CPU/mem/IO, RAPL energy, eBPF program run-time, cgroup stats for the sensors. |
 | `prometheus/bpfstats.py` | Reads per-program eBPF run-time via `bpf(2)` directly (no `bpftool` dependency); enables run-time stats and holds the fd so they auto-disable on exit. |
-| `syscall-bench.c` | `syscall-bench`: measures per-call latency of `getpid`/`openat`/`execve`. Distinct binary name for EDR allowlisting; optional CPU pinning. |
-| `prometheus/capture-baseline.py` | Captures the no-EDR baseline (A/B/A, with BPF-detach verification). |
 | `prometheus/compile-ab.py` | A/B benchmark of a *real* build with the sensors ON vs momentarily OFF (falcon eBPF-detach verified). Reports the per-build wall-clock, kernel-CPU, energy and eBPF deltas. Project-agnostic. |
 | `prometheus/idle-ab.py` | Idle A/B: fan RPM, package temperature, interrupt + eBPF rates and power with the sensors ON vs momentarily OFF. Shows the sensors keep an idle machine (and its fan) busy. |
 | `prometheus/file-trace.bt` | bpftrace script logging a process's file access (open/read/write/stat/readdir). Used to see *what* osquery touches. |
@@ -54,52 +51,24 @@ Two things make it visible again:
 - `node_bpf_stats_enabled` — 1 if run-time accounting is on.
 - `node_cgroup_cpu_seconds_total{cgroup,mode}`, `node_cgroup_memory_bytes`,
   `node_cgroup_pids` — clean attribution of the sensor daemons.
-- `node_syscall_bench_seconds{op}` / `node_syscall_bench_cpu_seconds{op}` — live
-  per-call latency.
-- `node_syscall_baseline_seconds{op,condition}`,
-  `node_syscall_baseline_overhead_seconds{op}`,
-  `node_syscall_baseline_stale` — from the captured baseline.
 
 ## Requirements
 
 - root (the exporter needs CAP_BPF/CAP_SYS_ADMIN for run-time stats and to read
   every process's `io`/`status`).
-- `python3`, a C compiler.
+- `python3`.
 - Prometheus and Grafana for storage and display.
 - `bpftrace` for the optional osquery file-trace.
 
 ## Install
 
 ```sh
-make                    # compile syscall-bench
-sudo make install       # install deps, binary and config, enable services
+sudo make install       # install deps and config, enable services
 ```
 
 `make install` installs the scrape config to `/etc/prometheus/prometheus.yml`
 and enables Prometheus (scraping the exporter on `localhost:9599`) and Grafana,
 which auto-loads the datasource and dashboard from `/etc/grafana/provisioning/`.
-
-## Establishing the baseline
-
-The baseline is the only way to state absolute "% slower without the sensor".
-It requires a window where the sensor is genuinely off. On a managed machine
-the sensor is restarted out of your control after a few hours, so this is
-a single, scripted window rather than a continuous A/B:
-
-```sh
-sudo taskset -c 2 ./prometheus/capture-baseline.py
-```
-
-Per bracket the script measures all-on, stops osquery, stops falcon **and
-verifies its eBPF programs actually detached** (stopping the service does not
-always detach the programs), measures, then restores. Because the external
-restart can fire mid-window, detachment is re-checked around every off-sample
-and any contaminated sample is discarded. The stepwise teardown attributes cost
-to osquery vs falcon separately.
-
-The output (`/var/lib/power-exporter/syscall-baseline.json` by default) is
-tagged with the kernel and sensor versions; `node_syscall_baseline_stale` flags
-when the running kernel no longer matches, i.e. when to recapture.
 
 ## A/B compile benchmark
 
@@ -164,36 +133,6 @@ seconds later, the fan to spin down — then ramp back when the services restart
 Results are written to `/var/lib/power-exporter/idle-ab.json`.
 
 ## Benchmark caveats
-
-- **Observer effect.** The benchmark adds syscall load to a syscall-overhead
-  measurement. Keep iteration counts small and the interval long (defaults do);
-  per-call `min` latency stays valid and the average footprint is negligible.
-
-- **EDR alerting, and how to allowlist without skewing the result.** The
-  `execve` benchmark is a tight `fork()` + `execve("/usr/bin/true")` loop
-  (~2,200 process spawns per run, which the exporter repeats five times every
-  15 minutes). To a behavioural sensor that looks like a fork-bomb or mass
-  process creation, which can page your SOC, get the benchmark throttled or
-  killed by the prevention policy, and corrupt the sample if the sensor steps
-  in mid-run. `syscall-bench` uses a distinct binary name on purpose, so a
-  rule is easy to target.
-
-  To silence it, have whoever administers the Falcon tenant add an *exclusion*
-  for the binary, by path (`/usr/local/bin/syscall-bench`) or SHA-256 hash; on
-  a managed CSB you usually cannot do this yourself. Ask specifically for a
-  **detection/prevention exclusion** (Falcon's IOA / ML exclusions) that
-  suppresses the *alert* while the eBPF programs keep running. Do **not**
-  accept a *sensor visibility exclusion*: it reduces monitoring of the binary
-  and makes the "sensor on" measurement artificially cheap, under-reporting
-  the overhead you are trying to quantify. The goal is to stop the sensor
-  crying wolf about this process, not to stop it watching it.
-
-  If you cannot get an exclusion added, drop the op instead:
-  `--bench-ops getpid,openat`. Those never spawn a process, so nothing looks
-  like a fork-bomb and there is nothing to allowlist; you lose the
-  process-spawn latency but keep file-open latency, where most of the compile
-  tax lives. This caveat applies to the microbenchmark only: `compile-ab.py`
-  runs real builds and needs no allowlisting.
 
 - **Pinning.** Pin the benchmark (`taskset -c <cpu>`) to a housekeeping core,
   never an isolated/DPDK core.

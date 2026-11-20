@@ -422,65 +422,9 @@
       }
     },
     {
-      "title": "Syscall Latency (benchmark)",
-      "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 54 },
-      "targets": [
-        { "expr": "node_syscall_bench_seconds", "legendFormat": "{{op}} (live)", "refId": "A" },
-        { "expr": "node_syscall_baseline_seconds{condition=\"no_edr\"}", "legendFormat": "{{op}} (no-EDR baseline)", "refId": "B" }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": {
-            "fillOpacity": 0,
-            "lineWidth": 2,
-            "spanNulls": true,
-            "scaleDistribution": { "type": "log", "log": 2 }
-          }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byRegexp", "options": ".*baseline.*" },
-            "properties": [
-              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 5] } }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "tooltip": { "mode": "multi", "sort": "desc" },
-        "legend": { "sortBy": "Max", "sortDesc": true }
-      }
-    },
-    {
-      "title": "Syscall EDR Overhead (per call, vs no-EDR baseline)",
-      "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 63 },
-      "targets": [
-        { "expr": "node_syscall_baseline_overhead_seconds", "legendFormat": "{{op}}", "refId": "A" }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": {
-            "fillOpacity": 20,
-            "lineWidth": 2,
-            "spanNulls": true,
-            "scaleDistribution": { "type": "log", "log": 2 }
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "tooltip": { "mode": "multi", "sort": "desc" },
-        "legend": { "sortBy": "Max", "sortDesc": true }
-      }
-    },
-    {
       "title": "Surveillance - cgroup CPU",
       "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 63 },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 54 },
       "targets": [
         { "expr": "rate(node_cgroup_cpu_seconds_total[1m])", "legendFormat": "{{cgroup}} {{mode}}", "refId": "A" }
       ],
@@ -504,10 +448,9 @@
     {
       "title": "Instrumentation Health",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 12, "x": 0, "y": 72 },
+      "gridPos": { "h": 4, "w": 12, "x": 0, "y": 63 },
       "targets": [
-        { "expr": "node_bpf_stats_enabled", "legendFormat": "BPF stats enabled", "refId": "A" },
-        { "expr": "node_syscall_baseline_stale", "legendFormat": "Baseline stale", "refId": "B" }
+        { "expr": "node_bpf_stats_enabled", "legendFormat": "BPF stats enabled", "refId": "A" }
       ],
       "fieldConfig": { "defaults": { "unit": "bool", "mappings": [] }, "overrides": [] },
       "options": {
