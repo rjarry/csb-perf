@@ -343,60 +343,9 @@
       }
     },
     {
-      "title": "eBPF Programs - Kernel CPU (hidden sensor overhead)",
-      "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 45 },
-      "targets": [
-        { "expr": "topk(10, rate(node_bpf_prog_run_seconds_total[1m]))", "legendFormat": "{{name}}", "refId": "A" },
-        { "expr": "sum(rate(node_bpf_prog_run_seconds_total[1m]))", "legendFormat": "total", "refId": "B" }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percentunit",
-          "custom": { "fillOpacity": 10, "lineWidth": 1, "spanNulls": true }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "total" },
-            "properties": [
-              { "id": "custom.lineWidth", "value": 2 },
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "white" } }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "tooltip": { "mode": "multi", "sort": "desc" },
-        "legend": { "sortBy": "Max", "sortDesc": true }
-      }
-    },
-    {
-      "title": "eBPF - Estimated Power",
-      "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 45 },
-      "targets": [
-        {
-          "expr": "scalar(rate(node_rapl_energy_joules[1m])) * sum(rate(node_bpf_prog_run_seconds_total[1m])) / scalar(sum(clamp_min(deriv(node_process_cpu_seconds_total[1m]), 0)))",
-          "legendFormat": "eBPF power",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "watt",
-          "custom": { "fillOpacity": 20, "lineWidth": 2, "spanNulls": true }
-        },
-        "overrides": []
-      },
-      "options": {
-        "tooltip": { "mode": "multi", "sort": "desc" },
-        "legend": { "sortBy": "Max", "sortDesc": true }
-      }
-    },
-    {
       "title": "Kernel (system) CPU - Build Tools",
       "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 54 },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 45 },
       "targets": [
         {
           "expr": "clamp_min(deriv(node_process_cpu_system_seconds_total{comm=~\"cc1|cc1plus|gcc|clang|ld|as|collect2|make|ninja|cmake|rustc|cargo\"}[1m]), 0)",
@@ -424,7 +373,7 @@
     {
       "title": "Surveillance - cgroup CPU",
       "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 54 },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 45 },
       "targets": [
         { "expr": "rate(node_cgroup_cpu_seconds_total[1m])", "legendFormat": "{{cgroup}} {{mode}}", "refId": "A" }
       ],
@@ -443,19 +392,6 @@
       "options": {
         "tooltip": { "mode": "multi", "sort": "desc" },
         "legend": { "sortBy": "Max", "sortDesc": true }
-      }
-    },
-    {
-      "title": "Instrumentation Health",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 12, "x": 0, "y": 63 },
-      "targets": [
-        { "expr": "node_bpf_stats_enabled", "legendFormat": "BPF stats enabled", "refId": "A" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "bool", "mappings": [] }, "overrides": [] },
-      "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
-        "colorMode": "background"
       }
     }
   ],

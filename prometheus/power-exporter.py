@@ -5,40 +5,9 @@ import http.server
 import os
 import pathlib
 
-import bpfstats
-
 RAPL_BASE = pathlib.Path("/sys/class/powercap")
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 CGROUP_BASE = pathlib.Path("/sys/fs/cgroup")
-
-# eBPF program type -> readable label (uapi/linux/bpf.h)
-BPF_PROG_TYPES = {
-    1: "socket_filter",
-    2: "kprobe",
-    3: "sched_cls",
-    4: "sched_act",
-    5: "tracepoint",
-    6: "xdp",
-    7: "perf_event",
-    8: "cgroup_skb",
-    9: "cgroup_sock",
-    13: "sock_ops",
-    14: "sk_skb",
-    15: "cgroup_device",
-    16: "sk_msg",
-    17: "raw_tracepoint",
-    18: "cgroup_sock_addr",
-    24: "raw_tracepoint_writable",
-    26: "tracing",
-    27: "struct_ops",
-    28: "ext",
-    29: "lsm",
-    30: "sk_lookup",
-    31: "syscall",
-    32: "netfilter",
-}
-
-_bpf_stats_ok = False
 
 
 def find_rapl_domain():
@@ -176,43 +145,6 @@ def format_processes(lines):
     lines.append("")
 
 
-def format_bpf(lines):
-    lines.append(
-        "# HELP node_bpf_stats_enabled Whether eBPF run-time accounting is on."
-    )
-    lines.append("# TYPE node_bpf_stats_enabled gauge")
-    lines.append(f"node_bpf_stats_enabled {1 if _bpf_stats_ok else 0}")
-
-    if not _bpf_stats_ok:
-        lines.append("")
-        return
-
-    # aggregate by (name, type): identically named programs are the same hook
-    agg = {}
-    for prog in bpfstats.iter_progs():
-        key = (prog["name"], prog["type"])
-        run_time, run_cnt = agg.get(key, (0, 0))
-        agg[key] = (run_time + prog["run_time_ns"], run_cnt + prog["run_cnt"])
-
-    lines.append(
-        "# HELP node_bpf_prog_run_seconds_total "
-        "In-kernel CPU time consumed by eBPF programs (counter). This is the "
-        "sensor overhead otherwise hidden inside every process's system time."
-    )
-    lines.append("# TYPE node_bpf_prog_run_seconds_total counter")
-    lines.append(
-        "# HELP node_bpf_prog_run_count_total Number of eBPF program invocations."
-    )
-    lines.append("# TYPE node_bpf_prog_run_count_total counter")
-
-    for (name, ptype), (run_time, run_cnt) in sorted(agg.items()):
-        type_name = BPF_PROG_TYPES.get(ptype, f"type{ptype}")
-        label = f'name="{escape(name)}",type="{type_name}"'
-        lines.append(f"node_bpf_prog_run_seconds_total{{{label}}} {run_time / 1e9}")
-        lines.append(f"node_bpf_prog_run_count_total{{{label}}} {run_cnt}")
-    lines.append("")
-
-
 def format_cgroups(lines, cgroups):
     emitted = False
     for name, path in cgroups.items():
@@ -273,7 +205,6 @@ def format_metrics(rapl_path, cgroups):
     lines.append("")
 
     format_processes(lines)
-    format_bpf(lines)
     format_cgroups(lines, cgroups)
 
     return "\n".join(lines) + "\n"
@@ -307,28 +238,12 @@ def main():
         default="falcon-sensor,osqueryd,orbit",
         help="system.slice services to report cgroup stats for",
     )
-    p.add_argument(
-        "--no-bpf-stats",
-        action="store_true",
-        help="do not enable eBPF run-time accounting",
-    )
     args = p.parse_args()
 
     rapl_path, rapl_name = find_rapl_domain()
     if not rapl_path:
         raise SystemExit("error: no RAPL domain found")
     print(f"using RAPL domain: {rapl_name} ({rapl_path})")
-
-    global _bpf_stats_ok
-    if not args.no_bpf_stats:
-        fd = bpfstats.enable_stats()
-        if fd is None:
-            print("warning: could not enable eBPF run-time stats (need root/CAP_BPF)")
-        else:
-            _bpf_stats_ok = True
-            # keep the fd for the whole process lifetime; stats auto-disable on exit
-            MetricsHandler._bpf_stats_fd = fd
-            print("eBPF run-time stats enabled")
 
     cgroups = {
         svc: CGROUP_BASE / "system.slice" / f"{svc}.service"

@@ -22,19 +22,23 @@ Two things make it visible again:
   window, with the sensors ON vs momentarily OFF, yields the wall-clock and
   power cost as developers actually feel it.
 
+The exporter itself is passive: it only reads `/proc`, `/sys` and cgroup files
+when scraped, and never runs anything in the background, so it does not perturb
+what it measures. The A/B tools are run by hand, when you want a measurement.
+
 ## Components
 
 | Path | Purpose |
 | --- | --- |
-| `prometheus/power-exporter.py` | Prometheus exporter: per-process CPU/mem/IO, RAPL energy, eBPF program run-time, cgroup stats for the sensors. |
-| `prometheus/bpfstats.py` | Reads per-program eBPF run-time via `bpf(2)` directly (no `bpftool` dependency); enables run-time stats and holds the fd so they auto-disable on exit. |
+| `prometheus/power-exporter.py` | Prometheus exporter: per-process CPU/mem/IO, RAPL energy, cgroup stats for the sensors. Pure `/proc` and `/sys` reads at scrape time, no background activity. |
+| `prometheus/bpfstats.py` | Reads per-program eBPF run-time via `bpf(2)` directly (no `bpftool` dependency); enables run-time stats and holds the fd so they auto-disable on exit. Used by the A/B tools. |
 | `prometheus/compile-ab.py` | A/B benchmark of a *real* build with the sensors ON vs momentarily OFF (falcon eBPF-detach verified). Reports the per-build wall-clock, kernel-CPU, energy and eBPF deltas. Project-agnostic. |
 | `prometheus/idle-ab.py` | Idle A/B: fan RPM, package temperature, interrupt + eBPF rates and power with the sensors ON vs momentarily OFF. Shows the sensors keep an idle machine (and its fan) busy. |
 | `prometheus/file-trace.bt` | bpftrace script logging a process's file access (open/read/write/stat/readdir). Used to see *what* osquery touches. |
 | `prometheus/prometheus.yml` | Prometheus scrape config (self + exporter on :9599). |
 | `grafana/dashboards/power.json` | Grafana dashboard. |
 | `grafana/provisioning/` | Grafana datasource + dashboard provisioning. |
-| `systemd/power-exporter.service` | Runs the exporter (as root; needs CAP_BPF for run-time stats). |
+| `systemd/power-exporter.service` | Runs the exporter (as root, to read every process's `io`/`status`). |
 | `systemd/osquery-trace.service` | Runs `file-trace.bt` against the live osqueryd pid, logging to `/var/log/osquery-trace.log`. |
 | `logrotate.d/osquery-trace` | Rotates the osquery trace log. |
 
@@ -46,16 +50,13 @@ Two things make it visible again:
   (this is where smeared eBPF cost lands).
 - `node_process_memory_rss_bytes{comm}`, `node_process_io_bytes_total{comm,direction}`.
 - `node_process_ctxt_switches_total{comm,kind}` — voluntary/nonvoluntary.
-- `node_bpf_prog_run_seconds_total{name,type}` / `node_bpf_prog_run_count_total`
-  — the direct, otherwise-hidden sensor overhead.
-- `node_bpf_stats_enabled` — 1 if run-time accounting is on.
 - `node_cgroup_cpu_seconds_total{cgroup,mode}`, `node_cgroup_memory_bytes`,
   `node_cgroup_pids` — clean attribution of the sensor daemons.
 
 ## Requirements
 
-- root (the exporter needs CAP_BPF/CAP_SYS_ADMIN for run-time stats and to read
-  every process's `io`/`status`).
+- root (the exporter reads every process's `io`/`status`; the A/B tools need
+  CAP_BPF/CAP_SYS_ADMIN for eBPF run-time stats).
 - `python3`.
 - Prometheus and Grafana for storage and display.
 - `bpftrace` for the optional osquery file-trace.
@@ -133,6 +134,11 @@ seconds later, the fan to spin down — then ramp back when the services restart
 Results are written to `/var/lib/power-exporter/idle-ab.json`.
 
 ## Benchmark caveats
+
+- **Nothing runs on its own.** The exporter never spawns processes; the A/B
+  tools only run real workloads (your build, or nothing at all when idle), so
+  there is no synthetic activity for a behavioural sensor to alert on and
+  nothing to allowlist.
 
 - **Pinning.** Pin the benchmark (`taskset -c <cpu>`) to a housekeeping core,
   never an isolated/DPDK core.
